@@ -3,7 +3,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import math
-from RIM_groupESN import RIMCell
+from RIM import RIMCell
 import numpy as np
 
 class MnistModel(nn.Module):

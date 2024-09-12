@@ -1,7 +1,9 @@
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import math
-from RIM import RIMCell
+from RIM_groupESN import RIMCell
 import numpy as np
 
 class MnistModel(nn.Module):
@@ -21,6 +23,7 @@ class MnistModel(nn.Module):
 	def to_device(self, x):
 		return torch.from_numpy(x).to(self.device)
 
+
 	def forward(self, x, y = None):
 		x = x.float()
 		
@@ -29,19 +32,32 @@ class MnistModel(nn.Module):
 		cs = None
 		if self.args['rnn_cell'] == 'LSTM':
 			cs = torch.randn(x.size(0), self.args['num_units'], self.args['hidden_size']).to(self.device)
+		#print('Hidden states initialization done!')
 
 		xs = torch.split(x, 1, 1)
 
 		# pass through RIMCell for all timesteps
 		for x in xs:
 			hs, cs = self.rim_model(x, hs, cs)
+
+		assert not torch.isnan(hs.contiguous().view(x.size(0), -1)).any().item(), f'hs is NaN! The problem is given by {x}'
 		preds = self.Linear(hs.contiguous().view(x.size(0), -1))
+		#print('Sequence has passed through the RNN!')
 
 		if y is not None:
 			# Compute Loss
 			y = y.long()
 			probs = nn.Softmax(dim = -1)(preds)
+			# Ensure predictions are probabilities and avoid log(0) by adding a small epsilon
+			epsilon = 1e-12
+			probs = torch.clip(probs, epsilon, 1. - epsilon)
 			entropy = torch.mean(torch.sum(probs*torch.log(probs), dim = 1))
+
+			# test for nan
+			assert not torch.isnan(y).any().item(), f'Y is NaN! The problem is given by {x}'
+			assert not torch.isnan(preds).any().item(), f'Preds is NaN! The problem is given by {x}'
+			assert not torch.isnan(entropy).any().item(), f'Entropy is NaN! The problem is given by {x}'
+
 			loss = self.Loss(preds, y) - entropy
 			return probs, loss
 		return preds
@@ -107,7 +123,7 @@ class CopyingModel(nn.Module):
 			self.device = torch.device('cuda')
 		else:
 			self.device = torch.device('cpu')
-		self.rim_model = RIM(self.device, args['input_size'], args['hidden_size'], args['num_units'],args['k'], args['rnn_cell'], args['key_size_input'], args['value_size_input'] , args['query_size_input'],
+		self.rim_model = RIMCell(self.device, args['input_size'], args['hidden_size'], args['num_units'],args['k'], args['rnn_cell'], args['key_size_input'], args['value_size_input'] , args['query_size_input'],
 			args['num_input_heads'], args['input_dropout'], args['key_size_comm'], args['value_size_comm'], args['query_size_comm'], args['num_input_heads'], args['comm_dropout']).to(self.device)
 
 		self.Linear = nn.Linear(args['hidden_size'] * args['num_units'], 9)

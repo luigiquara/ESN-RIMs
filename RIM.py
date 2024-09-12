@@ -1,9 +1,14 @@
+from typing import List
+
 import torch
 import torch.nn as nn
 import math
 
 import numpy as np
 import torch.multiprocessing as mp
+
+from acds.archetypes.esn import DeepReservoir, ReservoirCell
+from acds.archetypes.utils import sparse_eye_init, sparse_recurrent_tensor_init, sparse_tensor_init, spectral_norm_scaling
 
 
 class blocked_grad(torch.autograd.Function):
@@ -17,6 +22,112 @@ class blocked_grad(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, mask = ctx.saved_tensors
         return grad_output * mask, mask * 0.0
+
+class GroupESNCell(nn.Module):
+	"""
+	GroupESNCell can compute the operation of N ESN Cells at once.
+	"""
+	def __init__(
+		self,
+		num_esns: int,
+		input_size: int,
+		hidden_sizes: List[int],
+		input_scalings: List[float] = None,
+		spectral_radiuses: List[float] = None,
+		leakies: List[float] = None,
+		connectivities_input: List[int] = None,
+		connectivities_recurrent: List[int] = None 
+	):
+		"""Initialize the GroupESNCell
+
+		Args:
+			input_size (int): number of input units.
+			hidden_size (int): number of recurrent units in the reservoir.
+			num_esns (int): number of reservoir cells.
+			input_scalings (list[float]): the i-th value is the max abs value 
+				of a weight in the input-reservoir connections,
+				related to the i-th reservoir cell. 
+				Note that this value also scalses the unitary input bias.
+				Defaults to 1.0 for all reservoir cells.
+			spectral_radiuses (list[float]): the i-th value is the max abs eigenvalue of the recurrent matrix,
+				related to the i-th reservoir cell.
+				Defaults to 0.99 for all reservoir cells.
+			leakies (list[float]): the i-th value is the leaking rate constant of the reservoir,
+				related to the i-th reservoir cell.
+				Defaults to 1.0 for all reservoir cells.
+			connectivities_input (list[int]): the i-th value is the number of ongoing connections
+				from each input unit to the i-th reservoir cell.
+				Defaults to 10 for all reservoir cells.
+			connectivities_recurrent (list[int]): the i-th value is the number of incoming recurrent corrections
+				for each reservoir unit related to the i-th reservoir cell.
+				Defaults to 10 for all reservoir cells.
+
+		"""
+		
+		super().__init__()
+		
+		self.num_esns = num_esns
+		self.input_size = input_size
+		self.hidden_sizes = hidden_sizes
+
+		# just a way to define default values when the list size is not fixed
+		self.input_scalings = input_scalings if input_scalings else [1.0]*num_esns
+		self.spectral_radiuses = spectral_radiuses if spectral_radiuses else [0.99]*num_esns
+		self.leakies = leakies if leakies else [1.0]*num_esns
+		self.leakies = torch.FloatTensor(self.leakies)
+		self.connectivities_input = connectivities_input if connectivities_input else [10]*num_esns
+		self.connectivities_recurrent = connectivities_recurrent if connectivities_recurrent else [10]*num_esns
+
+		self.kernels = [
+			sparse_tensor_init(input_size, self.hidden_sizes[i], self.connectivities_input[i]) * self.input_scalings[i]
+			for i in range(self.num_esns)
+		]
+		self.kernels = [nn.Parameter(k, requires_grad=False) for k in self.kernels]
+		self.kernels = torch.stack(self.kernels)
+
+		W = [
+			sparse_recurrent_tensor_init(self.hidden_sizes[i], C=self.connectivities_recurrent[i])
+			for i in range(self.num_esns)
+		]
+		self.recurrent_kernels = []
+		self.biases = []
+
+		for i in range(self.num_esns):
+
+			# re-scale the weight matrix to control the effective spectral radius of the linearized system
+			if self.leakies[i] == 1:
+				W[i] = spectral_norm_scaling(W[i], self.spectral_radiuses[i])
+				recurrent_kernel = W[i]
+			else:
+				I = sparse_eye_init(self.hidden_sizes[i])
+				W[i] = W[i] * self.leakies[i] + (I + (1 - self.leakies[i]))
+				W[i] = spectral_norm_scaling(W[i], self.spectral_radiuses[i])
+				recurrent_kernel = (W[i] + I * (self.leakies[i] - 1)) * (1 / self.leakies[i])
+			self.recurrent_kernels.append(nn.Parameter(recurrent_kernel, requires_grad=False))
+
+			# uniform init in [-1, +1] times input_scaling
+			bias = (torch.rand(self.hidden_sizes[i]) * 2 - 1) * self.input_scalings[i]
+			self.biases.append(nn.Parameter(bias, requires_grad=False))
+		self.recurrent_kernels = torch.stack(self.recurrent_kernels)
+		self.biases = torch.stack(self.biases)
+
+	
+	def forward(self, xt: torch.Tensor, h_prev: torch.Tensor):
+		"""Computes the output of the set of cells given input and previous state.
+		"""
+
+		input_part = torch.bmm(xt, self.kernels)
+		state_part = torch.bmm(h_prev, self.recurrent_kernels)
+
+		input_part = input_part.permute(1, 0, 2)
+		state_part = state_part.permute(1, 0, 2)
+		output = torch.tanh(input_part + self.biases + state_part)
+		output = output.permute(1, 0, 2)
+
+		leaky_output = h_prev * (torch.ones(self.num_esns) - self.leakies).view(-1, 1, 1) + output * self.leakies.view(-1, 1, 1)
+
+		return leaky_output, leaky_output
+
 
 
 class GroupLinearLayer(nn.Module):
@@ -86,8 +197,6 @@ class GroupGRUCell(nn.Module):
         self.h2h = GroupLinearLayer(hidden_size, 3 * hidden_size, num_grus)
         self.reset_parameters()
 
-
-
     def reset_parameters(self):
         std = 1.0 / math.sqrt(self.hidden_size)
         for w in self.parameters():
@@ -147,6 +256,13 @@ class RIMCell(nn.Module):
 		if self.rnn_cell == 'GRU':
 			self.rnn = GroupGRUCell(input_value_size, hidden_size, num_units)
 			self.query = GroupLinearLayer(hidden_size,  input_key_size * num_input_heads, self.num_units)
+		elif self.rnn_cell == 'ESN':
+			print('Inside an ESN!')
+			# tried with input_size = 400, seq_len = 1
+			# will try the other way around
+			self.rnn = nn.ModuleList([ReservoirCell(input_value_size, units=hidden_size, leaky=0.001, connectivity_input=hidden_size, connectivity_recurrent=hidden_size) for _ in range(num_units)])
+			#self.rnn = GroupESNCell(num_units, input_value_size, [hidden_size]*num_units)
+			self.query = GroupLinearLayer(hidden_size, input_key_size * num_input_heads, self.num_units)
 		else:
 			self.rnn = GroupLSTMCell(input_value_size, hidden_size, num_units)
 			self.query = GroupLinearLayer(hidden_size,  input_key_size * num_input_heads, self.num_units)
@@ -156,6 +272,8 @@ class RIMCell(nn.Module):
 		self.comm_attention_output = GroupLinearLayer(num_comm_heads * comm_value_size, comm_value_size, self.num_units)
 		self.comm_dropout = nn.Dropout(p =input_dropout)
 		self.input_dropout = nn.Dropout(p =comm_dropout)
+
+		print(f'self.key is on {next(self.key.parameters()).device}')
 
 
 	def transpose_for_scores(self, x, num_attention_heads, attention_head_size):
@@ -191,6 +309,7 @@ class RIMCell(nn.Module):
 	    
 	    attention_probs = self.input_dropout(nn.Softmax(dim = -1)(attention_scores))
 	    inputs = torch.matmul(attention_probs, value_layer) * mask_.unsqueeze(2)
+	    #inputs = torch.split(inputs, 1, 1) # from commit 27001c4
 
 	    return inputs, mask_
 
@@ -248,13 +367,46 @@ class RIMCell(nn.Module):
 		if cs is not None:
 			c_old = cs * 1.0
 		
-
-		# Compute RNN(LSTM or GRU) output
+		# test for NaN
+		assert not torch.isnan(inputs).any().item(), 'Inputs is NaN!'
+		assert not torch.isnan(mask).any().item(), 'Mask is NaN!'
 		
-		if cs is not None:
-			hs, cs = self.rnn(inputs, (hs, cs))
+		# previous iterative implementation
+		# from previous versions of Recurrent-Independent-Mechanisms
+		# commit 27001c4
+		if self.rnn_cell == 'ESN':
+			hs = list(torch.split(hs, 1,1))
+			inputs = torch.split(inputs, 1, 1)
+
+
+		# Compute RNN(LSTM, GRU or ESN) output
+		states = []
+		if self.rnn_cell == 'ESN':
+
+			# previous iterative implementation
+			inputs = [i.squeeze(1) for i in inputs]
+			hs = [shs.squeeze(1) for shs in hs]
+			#inputs = [input.permute(0, 2, 1) for input in inputs]
+
+			# previous iterative implementation
+			for i in range(self.num_units):
+				# taking only the hidden state from the last input
+				#_, ls = self.rnn[i](inputs[i].squeeze(1))
+				_, hs[i] = self.rnn[i](inputs[i], hs[i])
+
+			#inputs = torch.stack(inputs)
+			#hs = torch.stack(hs)
+			#_, hs = self.rnn(inputs, hs)
+			
+			# previous iterative implementation
+			hs = torch.stack(hs, dim = 1)
+			if cs is not None: cs = torch.stack(cs, dim = 1)
+		
 		else:
-			hs = self.rnn(inputs, hs)
+			if cs is not None:
+				hs, cs = self.rnn(inputs, (hs, cs))
+			else:
+				hs = self.rnn(inputs, hs)
 
 		# Block gradient through inactive units
 		mask = mask.unsqueeze(2)
@@ -278,6 +430,7 @@ class RIM(nn.Module):
 			self.device = torch.device('cuda')
 		else:
 			self.device = torch.device('cpu')
+		print(f'Using {device}')
 		self.n_layers = n_layers
 		self.num_directions = 2 if bidirectional else 1
 		self.rnn_cell = rnn_cell
